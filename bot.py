@@ -13,7 +13,6 @@ from dotenv import load_dotenv
 # .env ファイルの読み込み
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
-TEST_MODE = os.getenv('TEST_MODE', 'False').lower() == 'true'
 
 DATA_FILE = 'channels.json'
 
@@ -46,8 +45,25 @@ def get_ntp_offset():
 class TimeSignalBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix='!', intents=discord.Intents.default())
-        # データ構造: { "guild_id": {"channel_id": channel_id, "is_paused": bool} }
+        # データ構造: { "guild_id": {"channel_id": channel_id, "is_paused": bool, "is_test": bool} }
         self.guild_settings = self.load_data()
+        self.cached_offset = 0.0
+        self.last_ntp_sync = 0.0
+
+    async def get_current_offset(self):
+        # 30分 (1800秒) に1回だけNTPと同期する
+        current_time = time.time()
+        if current_time - self.last_ntp_sync > 1800 or self.last_ntp_sync == 0.0:
+            loop = asyncio.get_running_loop()
+            try:
+                # get_ntp_offsetはブロッキング通信があるためexecutorで非同期実行
+                offset = await loop.run_in_executor(None, get_ntp_offset)
+                self.cached_offset = offset
+                self.last_ntp_sync = current_time
+                print(f"[NTP Sync] Offset updated: {self.cached_offset:.3f} seconds")
+            except Exception as e:
+                print(f"[NTP Sync] Failed to update offset: {e}")
+        return self.cached_offset
 
     def load_data(self):
         if not os.path.exists(DATA_FILE):
@@ -73,6 +89,8 @@ class TimeSignalBot(commands.Bot):
             json.dump(self.guild_settings, f, ensure_ascii=False, indent=4)
 
     async def setup_hook(self):
+        # NTP同期を非同期タスクとして実行し、起動をブロックしないようにする
+        asyncio.create_task(self.get_current_offset())
         # スラッシュコマンドを同期
         await self.tree.sync()
         # 時報タスクの開始
@@ -84,55 +102,65 @@ class TimeSignalBot(commands.Bot):
 
     @tasks.loop()
     async def time_signal_task(self):
-        # 毎回NTPから正確なオフセットを取得して補正
-        offset = get_ntp_offset()
+        # 30分間隔でキャッシュされたNTPオフセットを取得
+        offset = await self.get_current_offset()
         
         jst_timezone = datetime.timezone(datetime.timedelta(hours=9))
         now_local = datetime.datetime.now(jst_timezone)
         # 現在の正確な時刻 (NTP補正値込み)
         now_actual = now_local + datetime.timedelta(seconds=offset)
         
-        # 次のアナウンス対象時刻を計算
-        if TEST_MODE:
-            # テストモード: 次の「分」の00秒をターゲットにする（最大60秒待機）
-            next_target_actual = (now_actual.replace(second=0, microsecond=0) + datetime.timedelta(minutes=1))
-        else:
-            # 通常モード: 次の「時間」の00分00秒をターゲットにする（最大1時間待機）
-            next_target_actual = (now_actual.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1))
+        # 次の「分」の00秒をターゲットにする（最大60秒待機）
+        # 各ギルドでテストモードが動く可能性があるため、ループ自体は毎分実行します
+        next_target_actual = (now_actual.replace(second=0, microsecond=0) + datetime.timedelta(minutes=1))
         
         # 待機秒数を計算
         sleep_seconds = (next_target_actual - now_actual).total_seconds()
         
-        # マイナス秒数（既に過ぎている極小の誤差など）の場合は最小の待機を設定
+        # マイナス秒数の場合は最小の待機を設定
         if sleep_seconds <= 0:
-            sleep_seconds = 60 if TEST_MODE else 3600
+            sleep_seconds = 60
             
-        print(f"[TimeSignal] {'[TEST MODE] ' if TEST_MODE else ''}Sleeping for {sleep_seconds:.3f} seconds until {next_target_actual.strftime('%Y-%m-%d %H:%M:%S')} JST")
         await asyncio.sleep(sleep_seconds)
         
         # 待機明け（時報送信時間）
         # 送信時の実際の時間を取得して、アナウンスする時間を決定
         now_send = datetime.datetime.now(jst_timezone) + datetime.timedelta(seconds=offset)
-        
-        if TEST_MODE:
-            # テストモード時は分や秒誤差まで詳細に表示
-            announce_text = f"【テスト時報】{now_send.hour}時{now_send.minute}分をお知らせします（NTP誤差補正: {offset:.3f}秒）"
-        else:
-            # 0.5秒足してから時間を取得することで、直前の極小の遅延によるズレを吸収して丸める
-            hour = (now_send + datetime.timedelta(seconds=0.5)).hour
-            announce_text = f"{hour}時をお知らせします"
+        # 0.5秒足して丸める
+        rounded_now = now_send + datetime.timedelta(seconds=0.5)
+        hour = rounded_now.hour
+        minute = rounded_now.minute
         
         for guild_id_str, settings in self.guild_settings.items():
             if settings.get("is_paused", False):
                 continue
             channel_id = settings.get("channel_id")
-            if channel_id:
-                channel = self.get_channel(channel_id)
-                if channel:
+            if not channel_id:
+                continue
+                
+            channel = self.get_channel(channel_id)
+            if not channel:
+                continue
+                
+            is_test = settings.get("is_test", False)
+            
+            if is_test:
+                # テストモードのサーバーには毎分送信
+                announce_text = f"【テスト時報】{hour}時{minute}分をお知らせします（NTP誤差補正: {offset:.3f}秒）"
+                try:
+                    await channel.send(announce_text)
+                except discord.Forbidden:
+                    print(f"Missing permissions in {channel.name} ({guild_id_str})")
+                except Exception as e:
+                    print(f"Error sending message in {guild_id_str}: {e}")
+            else:
+                # 通常サーバーには毎時00分のみ送信
+                if minute == 0:
+                    announce_text = f"{hour}時をお知らせします"
                     try:
                         await channel.send(announce_text)
                     except discord.Forbidden:
-                        print(f"Missing permissions to send message in {channel.name} ({guild_id_str})")
+                        print(f"Missing permissions in {channel.name} ({guild_id_str})")
                     except Exception as e:
                         print(f"Error sending message in {guild_id_str}: {e}")
 
@@ -202,11 +230,24 @@ async def test_signal(interaction: discord.Interaction):
     hour = now.hour
     await interaction.response.send_message(f"【テスト時報】{hour}時をお知らせします（即時送信テスト）", ephemeral=False)
 
+@bot.tree.command(name="set_test_mode", description="このサーバーの時報をテストモード（毎分発信）に設定します")
+@app_commands.checks.has_permissions(administrator=True)
+async def set_test_mode(interaction: discord.Interaction, enabled: bool):
+    guild_id = str(interaction.guild.id)
+    if guild_id in bot.guild_settings:
+        bot.guild_settings[guild_id]["is_test"] = enabled
+        bot.save_data()
+        mode_str = "有効" if enabled else "無効"
+        await interaction.response.send_message(f"テストモードを**{mode_str}**にしました。{'毎分時報が送信されます。' if enabled else '通常の毎時00分の時報に戻ります。'}", ephemeral=False)
+    else:
+        await interaction.response.send_message("時報の送信先が設定されていません。先に`/set_signal_channel`を実行してください。", ephemeral=True)
+
 @set_signal_channel.error
 @remove_signal_channel.error
 @stop_signal.error
 @resume_signal.error
 @test_signal.error
+@set_test_mode.error
 async def command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("このコマンドを実行するには管理者権限が必要です。", ephemeral=True)
