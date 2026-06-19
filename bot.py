@@ -4,19 +4,44 @@ from discord import app_commands
 import json
 import os
 import datetime
+import socket
+import struct
+import time
+import asyncio
 from dotenv import load_dotenv
 
 # .env ファイルの読み込み
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
+TEST_MODE = os.getenv('TEST_MODE', 'False').lower() == 'true'
 
 DATA_FILE = 'channels.json'
 
-# 毎時00分00秒（UTC）のリストを作成
-HOURLY_TIMES = [
-    datetime.time(hour=h, minute=0, second=0, tzinfo=datetime.timezone.utc)
-    for h in range(24)
-]
+def get_ntp_offset():
+    """外部NTPサーバーから正確な時刻を取得し、システム時刻との差分（秒）を計算します。
+    戻り値: ntp_time - local_time
+    """
+    servers = ["ntp.nict.jp", "time.google.com", "pool.ntp.org"]
+    port = 123
+    data = b'\x1b' + 47 * b'\0'
+    for server in servers:
+        try:
+            client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            client.settimeout(1.5)
+            t_send = time.time()
+            client.sendto(data, (server, port))
+            response, _ = client.recvfrom(1024)
+            t_recv = time.time()
+            if response:
+                unpacked = struct.unpack("!12I", response)
+                ntp_seconds = unpacked[10] - 2208988800
+                local_average = (t_recv + t_send) / 2
+                offset = ntp_seconds - local_average
+                return offset
+        except Exception as e:
+            print(f"NTP query to {server} failed: {e}")
+    print("All NTP queries failed. Using local time (offset = 0.0)")
+    return 0.0
 
 class TimeSignalBot(commands.Bot):
     def __init__(self):
@@ -57,13 +82,45 @@ class TimeSignalBot(commands.Bot):
         print(f'Logged in as {self.user} (ID: {self.user.id})')
         print('------')
 
-    @tasks.loop(time=HOURLY_TIMES)
+    @tasks.loop()
     async def time_signal_task(self):
-        # 設定された時間（毎時00分00秒）に自動的に呼び出される
-        # 日本標準時 (JST: UTC+9) のタイムゾーンを指定して時刻を取得
+        # 毎回NTPから正確なオフセットを取得して補正
+        offset = get_ntp_offset()
+        
         jst_timezone = datetime.timezone(datetime.timedelta(hours=9))
-        now = datetime.datetime.now(jst_timezone)
-        hour = now.hour
+        now_local = datetime.datetime.now(jst_timezone)
+        # 現在の正確な時刻 (NTP補正値込み)
+        now_actual = now_local + datetime.timedelta(seconds=offset)
+        
+        # 次のアナウンス対象時刻を計算
+        if TEST_MODE:
+            # テストモード: 次の「分」の00秒をターゲットにする（最大60秒待機）
+            next_target_actual = (now_actual.replace(second=0, microsecond=0) + datetime.timedelta(minutes=1))
+        else:
+            # 通常モード: 次の「時間」の00分00秒をターゲットにする（最大1時間待機）
+            next_target_actual = (now_actual.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1))
+        
+        # 待機秒数を計算
+        sleep_seconds = (next_target_actual - now_actual).total_seconds()
+        
+        # マイナス秒数（既に過ぎている極小の誤差など）の場合は最小の待機を設定
+        if sleep_seconds <= 0:
+            sleep_seconds = 60 if TEST_MODE else 3600
+            
+        print(f"[TimeSignal] {'[TEST MODE] ' if TEST_MODE else ''}Sleeping for {sleep_seconds:.3f} seconds until {next_target_actual.strftime('%Y-%m-%d %H:%M:%S')} JST")
+        await asyncio.sleep(sleep_seconds)
+        
+        # 待機明け（時報送信時間）
+        # 送信時の実際の時間を取得して、アナウンスする時間を決定
+        now_send = datetime.datetime.now(jst_timezone) + datetime.timedelta(seconds=offset)
+        
+        if TEST_MODE:
+            # テストモード時は分や秒誤差まで詳細に表示
+            announce_text = f"【テスト時報】{now_send.hour}時{now_send.minute}分をお知らせします（NTP誤差補正: {offset:.3f}秒）"
+        else:
+            # 0.5秒足してから時間を取得することで、直前の極小の遅延によるズレを吸収して丸める
+            hour = (now_send + datetime.timedelta(seconds=0.5)).hour
+            announce_text = f"{hour}時をお知らせします"
         
         for guild_id_str, settings in self.guild_settings.items():
             if settings.get("is_paused", False):
@@ -73,7 +130,7 @@ class TimeSignalBot(commands.Bot):
                 channel = self.get_channel(channel_id)
                 if channel:
                     try:
-                        await channel.send(f'{hour}時をお知らせします')
+                        await channel.send(announce_text)
                     except discord.Forbidden:
                         print(f"Missing permissions to send message in {channel.name} ({guild_id_str})")
                     except Exception as e:
@@ -137,10 +194,19 @@ async def resume_signal(interaction: discord.Interaction):
     else:
         await interaction.response.send_message("時報の送信先が設定されていません。先に`/set_signal_channel`を実行してください。", ephemeral=True)
 
+@bot.tree.command(name="test_signal", description="【テスト】現在の時間で時報を即座に送信テストします")
+@app_commands.checks.has_permissions(administrator=True)
+async def test_signal(interaction: discord.Interaction):
+    jst_timezone = datetime.timezone(datetime.timedelta(hours=9))
+    now = datetime.datetime.now(jst_timezone)
+    hour = now.hour
+    await interaction.response.send_message(f"【テスト時報】{hour}時をお知らせします（即時送信テスト）", ephemeral=False)
+
 @set_signal_channel.error
 @remove_signal_channel.error
 @stop_signal.error
 @resume_signal.error
+@test_signal.error
 async def command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("このコマンドを実行するには管理者権限が必要です。", ephemeral=True)
