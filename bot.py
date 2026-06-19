@@ -60,7 +60,9 @@ class TimeSignalBot(commands.Bot):
     @tasks.loop(time=HOURLY_TIMES)
     async def time_signal_task(self):
         # 設定された時間（毎時00分00秒）に自動的に呼び出される
-        now = datetime.datetime.now()
+        # 日本標準時 (JST: UTC+9) のタイムゾーンを指定して時刻を取得
+        jst_timezone = datetime.timezone(datetime.timedelta(hours=9))
+        now = datetime.datetime.now(jst_timezone)
         hour = now.hour
         
         for guild_id_str, settings in self.guild_settings.items():
@@ -100,7 +102,7 @@ async def set_signal_channel(interaction: discord.Interaction):
     await interaction.response.send_message(f"このチャンネル({interaction.channel.mention})を時報の送信先に設定しました。", ephemeral=False)
 
 @bot.tree.command(name="remove_signal_channel", description="このサーバーでの時報設定を解除します")
-@app_commands.checks.has_permissions(administrator=False)
+@app_commands.checks.has_permissions(administrator=True)
 async def remove_signal_channel(interaction: discord.Interaction):
     guild_id = str(interaction.guild.id)
     if guild_id in bot.guild_settings:
