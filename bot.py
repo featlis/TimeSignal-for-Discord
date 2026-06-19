@@ -97,16 +97,16 @@ async def set_signal_channel(interaction: discord.Interaction):
         "is_paused": is_paused
     }
     bot.save_data()
-    await interaction.response.send_message(f"このチャンネル({interaction.channel.mention})を時報の送信先に設定しました。", ephemeral=True)
+    await interaction.response.send_message(f"このチャンネル({interaction.channel.mention})を時報の送信先に設定しました。", ephemeral=False)
 
 @bot.tree.command(name="remove_signal_channel", description="このサーバーでの時報設定を解除します")
-@app_commands.checks.has_permissions(administrator=True)
+@app_commands.checks.has_permissions(administrator=False)
 async def remove_signal_channel(interaction: discord.Interaction):
     guild_id = str(interaction.guild.id)
     if guild_id in bot.guild_settings:
         del bot.guild_settings[guild_id]
         bot.save_data()
-        await interaction.response.send_message("時報の送信先設定を解除しました。", ephemeral=True)
+        await interaction.response.send_message("時報の送信先設定を解除しました。", ephemeral=False)
     else:
         await interaction.response.send_message("時報の送信先は設定されていません。", ephemeral=True)
 
@@ -117,7 +117,7 @@ async def stop_signal(interaction: discord.Interaction):
     if guild_id in bot.guild_settings:
         bot.guild_settings[guild_id]["is_paused"] = True
         bot.save_data()
-        await interaction.response.send_message("時報を一時停止しました。`/resume_signal`で再開できます。", ephemeral=True)
+        await interaction.response.send_message("時報を一時停止しました。`/resume_signal`で再開できます。", ephemeral=False)
     else:
         await interaction.response.send_message("時報の送信先が設定されていないため、一時停止できません。", ephemeral=True)
 
@@ -129,7 +129,7 @@ async def resume_signal(interaction: discord.Interaction):
         if bot.guild_settings[guild_id]["is_paused"]:
             bot.guild_settings[guild_id]["is_paused"] = False
             bot.save_data()
-            await interaction.response.send_message("時報を再開しました。", ephemeral=True)
+            await interaction.response.send_message("時報を再開しました。", ephemeral=False)
         else:
             await interaction.response.send_message("時報は現在一時停止されていません。", ephemeral=True)
     else:
